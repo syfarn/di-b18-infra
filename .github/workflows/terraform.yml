@@ -1,92 +1,510 @@
+# Workflow ka display name
 name: Terraform CI/CD
 
+# Workflow trigger configuration
 on:
+
+  # Push events ke liye
   push:
     branches:
       - main
       - "feature/**"
 
+    # Reports commit hone par workflow dobara trigger nahi hoga
+    paths-ignore:
+      - "pipeline-reports/**"
+
+  # Main branch ke against pull request ke liye
   pull_request:
     branches:
       - main
 
+# Report commit karne ke liye write permission required hai
 permissions:
-  contents: read
+  contents: write
 
+# Sabhi jobs ke common environment variables
 env:
+
+  # Terraform configuration ki location
+  TF_WORKING_DIR: environments/preprod
+
+  # Azure authentication secrets
   ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
   ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+# Workflow ke total 5 jobs
 jobs:
 
-  terraform-plan:
-    name: Terraform Plan
+  # ============================================================
+  # JOB 1: Terraform Init, Format aur Validate
+  # ============================================================
+  terraform-init-validate:
+
+    # GitHub Actions UI me job ka naam
+    name: Terraform Init, Format and Validate
+
+    # Ubuntu runner use hoga
     runs-on: ubuntu-latest
 
+    # Sabhi run commands Terraform directory me execute hongi
     defaults:
       run:
         working-directory: environments/preprod
 
+    # Job ke steps
     steps:
 
+      # Repository ko runner par download karega
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Reports store karne ke liye directory banayega
+      - name: Create Report Directory
+        run: mkdir -p ../../pipeline-reports
+
+      # Terraform CLI install karega
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.12.2
 
+      # Azure secrets ki availability check karega
       - name: Check Azure Secrets
         shell: bash
         run: |
-          test -n "$ARM_CLIENT_ID" && echo "ARM_CLIENT_ID present" || echo "ARM_CLIENT_ID MISSING"
-          test -n "$ARM_CLIENT_SECRET" && echo "ARM_CLIENT_SECRET present" || echo "ARM_CLIENT_SECRET MISSING"
-          test -n "$ARM_TENANT_ID" && echo "ARM_TENANT_ID present" || echo "ARM_TENANT_ID MISSING"
-          test -n "$ARM_SUBSCRIPTION_ID" && echo "ARM_SUBSCRIPTION_ID present" || echo "ARM_SUBSCRIPTION_ID MISSING"
+          {
+            test -n "$ARM_CLIENT_ID" || {
+              echo "ARM_CLIENT_ID MISSING"
+              exit 1
+            }
 
+            test -n "$ARM_CLIENT_SECRET" || {
+              echo "ARM_CLIENT_SECRET MISSING"
+              exit 1
+            }
+
+            test -n "$ARM_TENANT_ID" || {
+              echo "ARM_TENANT_ID MISSING"
+              exit 1
+            }
+
+            test -n "$ARM_SUBSCRIPTION_ID" || {
+              echo "ARM_SUBSCRIPTION_ID MISSING"
+              exit 1
+            }
+
+            echo "All Azure secrets are present"
+          } 2>&1 | tee ../../pipeline-reports/azure-secrets-check.txt
+
+      # Backend, providers aur modules initialize karega
+      # Output report file me bhi save hoga
       - name: Terraform Init
-        run: terraform init
+        run: |
+          terraform init -input=false \
+            2>&1 | tee ../../pipeline-reports/terraform-init.txt
 
+      # Terraform formatting check karega
+      # Incorrect formatting par functional validation fail hogi
       - name: Terraform Format Check
-        run: terraform fmt -check -recursive
+        run: |
+          terraform fmt -check -recursive \
+            2>&1 | tee ../../pipeline-reports/terraform-format.txt
 
+      # Terraform configuration validate karega
       - name: Terraform Validate
-        run: terraform validate
+        run: |
+          terraform validate -no-color \
+            2>&1 | tee ../../pipeline-reports/terraform-validate.txt
 
-      - name: Terraform Plan
-        run: terraform plan
+      # Job 1 ke reports temporarily artifact me save karega
+      - name: Upload Init and Validation Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-init-validate-${{ github.run_id }}
+          path: pipeline-reports
+          if-no-files-found: warn
+          retention-days: 7
 
+  # ============================================================
+  # JOB 2: TFLint aur Checkov scanning
+  # ============================================================
+  security-scanning:
 
-  terraform-apply:
-    name: Terraform Apply
+    # GitHub Actions UI me job ka naam
+    name: TFLint and Checkov Scan
+
+    # Job 1 successful hone ke baad chalega
+    needs: terraform-init-validate
+
+    # Ubuntu runner use hoga
     runs-on: ubuntu-latest
 
-    needs: terraform-plan
-
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
+    # Run commands Terraform directory me execute hongi
     defaults:
       run:
         working-directory: environments/preprod
 
+    # Security scanning steps
     steps:
 
+      # Repository ko naye runner par download karega
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Report directory banayega
+      - name: Create Report Directory
+        run: mkdir -p ../../pipeline-reports
+
+      # TFLint tool install karega
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      # TFLint plugins initialize karega
+      - name: Initialize TFLint
+        run: |
+          tflint --init \
+            2>&1 | tee ../../pipeline-reports/tflint-init.txt
+
+      # Terraform code quality scan karega
+      # Findings report hongi, lekin pipeline nahi rukegi
+      - name: Run TFLint Scan
+        continue-on-error: true
+        run: |
+          tflint --recursive --format compact \
+            2>&1 | tee ../../pipeline-reports/tflint-report.txt
+
+      # Checkov CLI install karega
+      - name: Install Checkov
+        run: python -m pip install checkov
+
+      # Terraform security vulnerabilities scan karega
+      # Findings milne par step warning dega, pipeline nahi rokega
+      - name: Run Checkov Security Scan
+        continue-on-error: true
+        run: |
+          checkov \
+            --directory . \
+            --framework terraform \
+            --output cli \
+            --no-guide \
+            2>&1 | tee ../../pipeline-reports/checkov-report.txt
+
+      # Checkov ka machine-readable JSON report banayega
+      # Ye step bhi pipeline ko block nahi karega
+      - name: Generate Checkov JSON Report
+        continue-on-error: true
+        run: |
+          checkov \
+            --directory . \
+            --framework terraform \
+            --output json \
+            --no-guide \
+            > ../../pipeline-reports/checkov-report.json
+
+      # Security reports ko artifact me upload karega
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-security-${{ github.run_id }}
+          path: pipeline-reports
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ============================================================
+  # JOB 3: Terraform Plan
+  # ============================================================
+  terraform-plan:
+
+    # GitHub Actions UI me job ka naam
+    name: Terraform Plan
+
+    # Security scan job complete hone ke baad chalega
+    # Scan findings job ko fail nahi karengi
+    needs: security-scanning
+
+    # Ubuntu runner use hoga
+    runs-on: ubuntu-latest
+
+    # Run commands Terraform directory me execute hongi
+    defaults:
+      run:
+        working-directory: environments/preprod
+
+    # Terraform Plan steps
+    steps:
+
+      # Repository checkout karega
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Report directory banayega
+      - name: Create Report Directory
+        run: mkdir -p ../../pipeline-reports
+
+      # Terraform CLI install karega
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.12.2
 
+      # Naye runner par Terraform initialize karega
       - name: Terraform Init
-        run: terraform init
+        run: |
+          terraform init -input=false \
+            2>&1 | tee ../../pipeline-reports/terraform-plan-init.txt
 
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
+      # Terraform plan generate karke tfplan me save karega
+      # Plan output ki text report bhi generate hogi
+      - name: Generate Terraform Plan
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan \
+            2>&1 | tee ../../pipeline-reports/terraform-plan.txt
 
+      # Exact tfplan ko Apply job ke liye upload karega
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: environments/preprod/tfplan
+          if-no-files-found: error
+          retention-days: 1
+
+      # Terraform Plan reports upload karega
+      - name: Upload Terraform Plan Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-terraform-plan-${{ github.run_id }}
+          path: pipeline-reports
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ============================================================
+  # JOB 4: Infracost Scan
+  # ============================================================
+  infracost-scan:
+
+    # GitHub Actions UI me job ka naam
+    name: Infracost Scan
+
+    # Terraform Plan ke baad chalega
+    needs: terraform-plan
+
+    # Ubuntu runner use hoga
+    runs-on: ubuntu-latest
+
+    # Run commands Terraform directory me execute hongi
+    defaults:
+      run:
+        working-directory: environments/preprod
+
+    # Infracost steps
+    steps:
+
+      # Repository checkout karega
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Report directory banayega
+      - name: Create Report Directory
+        run: mkdir -p ../../pipeline-reports
+
+      # Terraform CLI install karega
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      # Terraform initialize karega
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            2>&1 | tee ../../pipeline-reports/infracost-terraform-init.txt
+
+      # Job 3 ka saved Terraform plan download karega
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: environments/preprod
+
+      # Infracost CLI install aur authenticate karega
+      # Setup failure bhi deployment pipeline ko block nahi karega
+      - name: Setup Infracost
+        id: setup-infracost
+        continue-on-error: true
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # tfplan ko temporary JSON format me convert karega
+      # JSON file repository report me save nahi ki jayegi
+      - name: Convert Terraform Plan to JSON
+        run: terraform show -json tfplan > tfplan.json
+
+      # Monthly cost estimate generate karega
+      # Cost findings ya command failure pipeline ko block nahi karega
+      - name: Generate Infracost Report
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v infracost >/dev/null 2>&1; then
+            infracost breakdown \
+              --path tfplan.json \
+              --format table \
+              2>&1 | tee ../../pipeline-reports/infracost-report.txt
+          else
+            echo "Infracost CLI setup failed; cost scan was skipped." \
+              | tee ../../pipeline-reports/infracost-report.txt
+          fi
+
+      # Infracost reports ko artifact me upload karega
+      - name: Upload Infracost Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-infracost-${{ github.run_id }}
+          path: pipeline-reports
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ============================================================
+  # JOB 5: Terraform Apply aur reports repository me save karna
+  # ============================================================
+  terraform-apply:
+
+    # GitHub Actions UI me job ka naam
+    name: Approve, Apply and Save Reports
+
+    # Infracost job complete hone ke baad chalega
+    needs: infracost-scan
+
+    # Ubuntu runner use hoga
+    runs-on: ubuntu-latest
+
+    # Sirf main branch push/merge par Apply hoga
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Manual approval ke liye GitHub Environment
+    environment: preprod
+
+    # Ek samay par sirf ek Apply job chalega
+    concurrency:
+      group: terraform-preprod
+      cancel-in-progress: false
+
+    # Run commands Terraform directory me execute hongi
+    defaults:
+      run:
+        working-directory: environments/preprod
+
+    # Apply aur report publishing steps
+    steps:
+
+      # Repository checkout karega
+      # Git credentials report commit/push ke liye retain hongi
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # Final report directory banayega
+      - name: Create Report Directory
+        run: mkdir -p ../../pipeline-reports
+
+      # Pichle jobs ke sabhi report artifacts download karega
+      - name: Download All Reports
+        uses: actions/download-artifact@v4
+        with:
+
+          # Sirf report-* naam wale artifacts download honge
+          pattern: report-*-${{ github.run_id }}
+
+          # Sabhi reports ek directory me merge honge
+          merge-multiple: true
+
+          # Reports ki final repository directory
+          path: pipeline-reports
+
+      # Terraform CLI install karega
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      # Terraform initialize karega
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            2>&1 | tee ../../pipeline-reports/terraform-apply-init.txt
+
+      # Job 3 ka exact saved plan download karega
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: environments/preprod
+
+      # Approved Terraform plan Azure par apply karega
+      # Apply output report me save hoga
       - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+        id: terraform-apply
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan \
+            2>&1 | tee ../../pipeline-reports/terraform-apply.txt
+
+      # Workflow ki basic information report me add karega
+      - name: Generate Workflow Summary Report
+        if: always()
+        run: |
+          {
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "Commit: $GITHUB_SHA"
+            echo "Triggered by: $GITHUB_ACTOR"
+            echo "Apply result: ${{ steps.terraform-apply.outcome }}"
+            echo "Generated at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > ../../pipeline-reports/workflow-summary.txt
+
+      # Final reports ko GitHub artifact me bhi upload karega
+      - name: Upload Complete Pipeline Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complete-pipeline-reports-${{ github.run_id }}
+          path: pipeline-reports
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Reports ko main branch me commit karega
+      - name: Commit Reports to Repository
+        if: always()
+        working-directory: .
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add pipeline-reports
+
+          if git diff --cached --quiet; then
+            echo "No report changes to commit"
+          else
+            git commit -m "chore: update pipeline reports [skip ci]"
+            git push origin HEAD:main
+          fi

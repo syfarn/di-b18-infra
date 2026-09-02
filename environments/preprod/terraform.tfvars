@@ -76,7 +76,7 @@ vms = {
     vm_name         = "frontend-vm-1-dev"
     vm_size         = "Standard_B1s"
     admin_username  = "devopsadmin"
-    key_vault_name  = "kv-chor-dev-123"
+    key_vault_name  = "kv-chor-dev-2251"
     secret_name     = "admin-password"
     image_publisher = "Canonical"
     image_offer     = "0001-com-ubuntu-server-jammy"
@@ -185,7 +185,7 @@ load_balancers = {
 
 key_vaults = {
   kv1 = {
-    name        = "kv-chor-dev-123"
+    name        = "kv-chor-dev-125"
     location    = "centralindia"
     rg_name     = "rg-chor-dev"
     secret_name = "admin-password"
